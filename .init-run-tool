@@ -1,0 +1,4 @@
+{
+    "command": "source venv/bin/activate && uvicorn src.api.main:app --host 0.0.0.0 --port <port> --reload",
+    "working_directory": "/home/kavia/workspace/code-generation/fastqueueapi-107750-bdde5977/fastqueueapi"
+}
