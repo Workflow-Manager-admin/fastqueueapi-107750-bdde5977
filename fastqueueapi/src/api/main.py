@@ -1,10 +1,10 @@
+import os
+import json
+import fcntl
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Any, List, Optional
 from pydantic import BaseModel
-import os
-import redis
-import json
 
 app = FastAPI()
 
@@ -17,30 +17,117 @@ app.add_middleware(
 )
 
 # ==============================
-# Redis-backed queue for cross-process safety and durability
+# File-backed queue for cross-process safety and durability
 # ==============================
-# The queue is managed using a Redis list, so all FastAPI processes/instances see the same queue state.
-# Redis settings: can be configured via environment variables.
+QUEUE_FILE_PATH = os.environ.get("FASTQUEUE_FILE", "./fastqueue_file.queue")  # Default file path
 
-REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
-REDIS_QUEUE_DEFAULT = "fastqueueapi_queue"
-REDIS_QUEUE_NAME = os.environ.get(
-    "REDIS_QUEUE_NAME",
-    REDIS_QUEUE_DEFAULT
-)
 
-redis_client = redis.Redis(
-    host=REDIS_HOST,
-    port=REDIS_PORT,
-    db=0,
-    decode_responses=True
-)
+def _acquire_lock(fd):
+    """
+    Acquire an exclusive lock on the given file descriptor.
+    """
+    fcntl.flock(fd, fcntl.LOCK_EX)
+
+
+def _release_lock(fd):
+    """
+    Release the lock on the given file descriptor.
+    """
+    fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def _read_queue():
+    """
+    Safely read all items from the queue file. Returns a list.
+    """
+    if not os.path.exists(QUEUE_FILE_PATH):
+        return []
+    with open(QUEUE_FILE_PATH, "r") as f:
+        _acquire_lock(f)
+        try:
+            f.seek(0)
+            lines = f.readlines()
+            messages = []
+            for line in lines:
+                line = line.strip()
+                if line:
+                    try:
+                        messages.append(json.loads(line))
+                    except Exception:
+                        messages.append(line)
+            return messages
+        finally:
+            _release_lock(f)
+
+
+def _write_queue(messages):
+    """
+    Overwrite the queue file atomically with the given list.
+    """
+    with open(QUEUE_FILE_PATH, "w") as f:
+        _acquire_lock(f)
+        try:
+            for msg in messages:
+                if not isinstance(msg, str):
+                    f.write(json.dumps(msg) + "\n")
+                else:
+                    f.write(msg.rstrip("\n") + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            _release_lock(f)
+
+
+def _append_to_queue(msg):
+    """
+    Appends a message to the queue file (FIFO).
+    """
+    with open(QUEUE_FILE_PATH, "a") as f:
+        _acquire_lock(f)
+        try:
+            if not isinstance(msg, str):
+                msg = json.dumps(msg)
+            f.write(msg + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            _release_lock(f)
+
+
+def _pop_from_queue():
+    """
+    Pops (removes and returns) the first message from the queue file. Returns (msg, queue_size).
+    """
+    # Read and lock the whole queue, remove first item, write back
+    if not os.path.exists(QUEUE_FILE_PATH):
+        return None, 0
+    with open(QUEUE_FILE_PATH, "r+") as f:
+        _acquire_lock(f)
+        try:
+            f.seek(0)
+            lines = f.readlines()
+            if not lines:
+                return None, 0
+            first_line = lines[0].strip()
+            rest = lines[1:]
+            f.seek(0)
+            f.truncate(0)
+            for line in rest:
+                f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+            try:
+                first_msg = json.loads(first_line)
+            except Exception:
+                first_msg = first_line
+            return first_msg, len(rest)
+        finally:
+            _release_lock(f)
+
 
 # ==============================
 # Request/Response Models
 # ==============================
-
 
 class EnqueueRequest(BaseModel):
     """Model for the message to be enqueued. Accepts arbitrary payload."""
@@ -77,14 +164,12 @@ def health_check():
 @app.post("/enqueue", response_model=EnqueueResponse)
 async def enqueue_message(req: EnqueueRequest):
     """
-    Add a message to the queue using Redis (LPUSH for queue semantics).
-    LPUSH (left-push) adds to head; we'll use RPUSH for FIFO (right-push), so we dequeue from left.
+    Add a message to the queue using file-backed persistence.
     """
-    # Serialize the payload as JSON to store in Redis list
-    serialized = json.dumps(req.payload)
-    redis_client.rpush(REDIS_QUEUE_NAME, serialized)
-    size = redis_client.llen(REDIS_QUEUE_NAME)
-    return EnqueueResponse(status="enqueued", queue_size=size)
+    _append_to_queue(req.payload)
+    # Re-read size to ensure durable acknowledgement
+    queue_size = len(_read_queue())
+    return EnqueueResponse(status="enqueued", queue_size=queue_size)
 
 
 # PUBLIC_INTERFACE
@@ -92,18 +177,10 @@ async def enqueue_message(req: EnqueueRequest):
 async def dequeue_message():
     """
     Retrieve and remove the next message from the queue.
-    Uses Redis LPOP for FIFO order.
     """
-    serialized = redis_client.lpop(REDIS_QUEUE_NAME)
-    if serialized is None:
-        size = redis_client.llen(REDIS_QUEUE_NAME)
-        return DequeueResponse(status="empty", message=None, queue_size=size)
-    try:
-        message = json.loads(serialized)
-    except Exception:
-        message = serialized
-    size = redis_client.llen(REDIS_QUEUE_NAME)
-    return DequeueResponse(status="dequeued", message=message, queue_size=size)
+    message, size = _pop_from_queue()
+    status = "dequeued" if message is not None else "empty"
+    return DequeueResponse(status=status, message=message, queue_size=size)
 
 
 # PUBLIC_INTERFACE
@@ -112,14 +189,7 @@ async def queue_status(list_messages: bool = False):
     """
     Return status of the queue. Optionally return all pending messages.
     """
-    size = redis_client.llen(REDIS_QUEUE_NAME)
-    if list_messages:
-        # Get all pending messages
-        serialized_pending = redis_client.lrange(REDIS_QUEUE_NAME, 0, -1)
-        try:
-            pending = [json.loads(item) for item in serialized_pending]
-        except Exception:
-            pending = serialized_pending
-    else:
-        pending = None
+    messages = _read_queue()
+    size = len(messages)
+    pending = messages if list_messages else None
     return QueueStatusResponse(queue_size=size, pending_messages=pending)
