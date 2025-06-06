@@ -19,6 +19,7 @@ app.add_middleware(
 # ==============================
 # In-memory queue and threading lock for concurrency safety
 # ==============================
+# Using global scope for queue and lock ensures persistence across FastAPI requests
 queue: List[Any] = []
 queue_lock = Lock()
 
